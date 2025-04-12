@@ -257,10 +257,17 @@ class MainActivity : ComponentActivity() {
                         // 如果有新句子且當前有顯示文字，則將當前文字添加到歷史
                         if (currentTextState.value.isNotEmpty() && currentTextState.value != text) {
                             previousText = currentTextState.value
+                            
+                            // 直接添加到歷史記錄，不檢查重複
+                            // 因為我們已經確認這是新的句子，與當前顯示的不同
                             addToHistory(previousText)
-                            // 確保UI更新
+                            
+                            // 強制更新UI
                             handler.post {
-                                // 這裡不需要額外操作，因為addToHistory已經更新了historyTextState
+                                // 確保主線程更新UI
+                                val temp = historyTextState.toList()
+                                historyTextState.clear()
+                                historyTextState.addAll(temp)
                             }
                         }
                         
@@ -325,9 +332,12 @@ class MainActivity : ComponentActivity() {
     
     private fun addToHistory(text: String) {
         if (text.isNotEmpty()) {
-            historyTextState.add(0, text)
-            if (historyTextState.size > 10) {
-                historyTextState.removeAt(historyTextState.size - 1)
+            // 檢查是否已經存在相同的文字，避免重複添加
+            if (!historyTextState.contains(text)) {
+                historyTextState.add(0, text)
+                if (historyTextState.size > 10) {
+                    historyTextState.removeAt(historyTextState.size - 1)
+                }
             }
         }
     }
@@ -500,6 +510,9 @@ fun HearingAidApp(
                     onStartListening()
                 }
             },
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (isListening) Color(0xFFE57373) else Color(0xFF4CAF50) // 停止聆聽為紅色，開始聆聽為綠色
+            ),
             modifier = Modifier
                 .padding(16.dp)
                 .height(56.dp)
