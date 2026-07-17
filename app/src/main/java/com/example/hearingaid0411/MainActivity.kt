@@ -3,72 +3,109 @@ package com.example.hearingaid0411
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.activity.viewModels
+import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.hearingaid0411.ui.theme.HearingAid0411Theme
-import java.util.*
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
-    private lateinit var speechRecognizer: SpeechRecognizer
-    private var isListening = false
-    
-    // 共享數據狀態
-    private val currentTextState = mutableStateOf("")
-    private val historyTextState = mutableStateListOf<String>()
-    private val isListeningState = mutableStateOf(false)
-    private val isSpeakingState = mutableStateOf(false)
-    
-    // 用於處理停頓檢測
+
+    private val viewModel: HearingViewModel by viewModels()
+
+    private var speechRecognizer: SpeechRecognizer? = null
     private val handler = Handler(Looper.getMainLooper())
-    private var pauseRunnable: Runnable? = null
-    private val PAUSE_DELAY = 3000L // 3秒停頓視為句子結束
-    
-    // 用於處理手動添加到歷史
-    private var lastRecognizedText = ""
-    private var hasNewSentence = false
-    private var previousText = "" // 新增變數，用於存儲上一句話
-    
-    // 用於背景確認最後一句話
-    private var autoSaveRunnable: Runnable? = null
-    private val AUTO_SAVE_DELAY = 5000L // 5秒後自動保存
+
+    /** 辨識引擎狀態機：消除「排程中/已啟動」的競態 */
+    private enum class RecState { IDLE, STARTING, LISTENING }
+
+    private var recState = RecState.IDLE
+    private var consecutiveErrors = 0
+    private var lastPartialHandledAt = 0L
+    private var lastRmsHandledAt = 0L
+
+    companion object {
+        private const val PARTIAL_THROTTLE_MS = 150L
+        private const val RMS_THROTTLE_MS = 100L
+        private const val MAX_NETWORK_RETRIES = 5
+        private const val MAX_CLIENT_RETRIES = 2
+    }
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (isGranted) {
-            startListening()
-            isListeningState.value = true
+    ) { granted ->
+        if (granted) {
+            viewModel.errorMessage = null
+            startListeningInternal()
         } else {
-            Toast.makeText(
-                this,
-                "需要麥克風權限才能使用語音辨識功能",
-                Toast.LENGTH_SHORT
-            ).show()
+            viewModel.wantsListening = false
+            viewModel.isListening = false
+            viewModel.errorMessage = UiError(
+                message = "需要麥克風權限，才能聽到聲音變成字幕",
+                actionLabel = "去開啟權限",
+                action = ErrorAction.OPEN_SETTINGS,
+            )
         }
     }
 
@@ -76,481 +113,584 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Initialize speech recognizer
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
-        
-        // 初始化自動保存功能
-        autoSaveRunnable = Runnable {
-            if (currentTextState.value.isNotEmpty() && !historyTextState.contains(currentTextState.value)) {
-                addToHistory(currentTextState.value)
-                // 不清空當前文字，保留在畫面上
-            }
-        }
-
         setContent {
-            HearingAid0411Theme {
+            HearingAid0411Theme(dynamicColor = false) {
+                // 聆聽中保持螢幕常亮（對話中螢幕熄滅是高齡使用者的致命傷）
+                val view = LocalView.current
+                LaunchedEffect(viewModel.isListening) {
+                    view.keepScreenOn = viewModel.isListening
+                }
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    HearingAidApp(
+                    HearingScreen(
                         modifier = Modifier.padding(innerPadding),
-                        onStartListening = { 
-                            checkPermissionAndStartListening() 
-                            isListeningState.value = true
-                        },
-                        onStopListening = { 
-                            stopListening() 
-                            isListeningState.value = false
-                        },
-                        onAddToHistory = {
-                            // 手動將當前文字添加到歷史並清空
-                            if (currentTextState.value.isNotEmpty()) {
-                                addToHistory(currentTextState.value)
-                                lastRecognizedText = ""
-                                currentTextState.value = ""
-                                hasNewSentence = false
+                        vm = viewModel,
+                        onStartListening = { onUserStart() },
+                        onStopListening = { onUserStop() },
+                        onErrorAction = { action ->
+                            when (action) {
+                                ErrorAction.OPEN_SETTINGS -> openAppSettings()
+                                ErrorAction.RETRY -> {
+                                    viewModel.errorMessage = null
+                                    onUserStart()
+                                }
+                                ErrorAction.NONE -> viewModel.errorMessage = null
                             }
                         },
-                        onClearHistory = {
-                            // 清除所有歷史記錄
-                            historyTextState.clear()
-                        },
-                        currentText = currentTextState.value,
-                        textHistory = historyTextState.toList(),
-                        isListening = isListeningState.value,
-                        isSpeaking = isSpeakingState.value
                     )
                 }
             }
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        
-        // 在應用退出前確保最後一句話被保存
-        if (currentTextState.value.isNotEmpty() && !historyTextState.contains(currentTextState.value)) {
-            addToHistory(currentTextState.value)
-        }
-        
-        speechRecognizer.destroy()
-        pauseRunnable?.let { handler.removeCallbacks(it) }
-        autoSaveRunnable?.let { handler.removeCallbacks(it) }
-    }
+    // ---- 使用者操作 ----
 
-    override fun onPause() {
-        super.onPause()
-        
-        // 在應用暫停時觸發自動保存
-        autoSaveRunnable?.let { handler.removeCallbacks(it) }
-        if (currentTextState.value.isNotEmpty()) {
-            handler.postDelayed(autoSaveRunnable!!, AUTO_SAVE_DELAY)
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        
-        // 取消任何待處理的自動保存
-        autoSaveRunnable?.let { handler.removeCallbacks(it) }
-    }
-
-    private fun checkPermissionAndStartListening() {
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
-            startListening()
+    private fun onUserStart() {
+        if (viewModel.wantsListening) return
+        viewModel.wantsListening = true
+        viewModel.errorMessage = null
+        if (hasMicPermission()) {
+            startListeningInternal()
         } else {
             requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
-    private fun startListening() {
-        if (isListening) return
+    private fun onUserStop() {
+        viewModel.wantsListening = false
+        handler.removeCallbacksAndMessages(null)
+        stopEngine()
+        // 停止時把還沒定稿的字保留進字幕流，不讓最後一句消失
+        if (viewModel.partialText.isNotBlank()) {
+            viewModel.finalizeSentence(viewModel.partialText)
+        }
+    }
 
-        val recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+    // ---- 引擎控制 ----
+
+    private fun hasMicPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun stopEngine() {
+        if (recState != RecState.IDLE) {
+            try { speechRecognizer?.cancel() } catch (_: Exception) {}
+            recState = RecState.IDLE
+        }
+        viewModel.isListening = false
+        viewModel.isSpeaking = false
+        viewModel.rmsLevel = 0
+    }
+
+    private fun stopWithError(error: UiError) {
+        viewModel.wantsListening = false
+        handler.removeCallbacksAndMessages(null)
+        stopEngine()
+        viewModel.errorMessage = error
+    }
+
+    private fun scheduleRestart(delayMs: Long) {
+        handler.postDelayed({
+            if (viewModel.wantsListening && recState == RecState.IDLE) startListeningInternal()
+        }, delayMs)
+    }
+
+    private fun startListeningInternal() {
+        if (!viewModel.wantsListening || recState != RecState.IDLE) return
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            stopWithError(UiError("這支手機沒有語音辨識功能，字幕無法使用"))
+            return
+        }
+        val recognizer = speechRecognizer ?: SpeechRecognizer.createSpeechRecognizer(this).also {
+            it.setRecognitionListener(recognitionListener)
+            speechRecognizer = it
+        }
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+            // 明確指定台灣繁中（原本傳 Locale 物件會被辨識服務忽略）
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-TW")
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 750)
         }
-
-        speechRecognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {
-                Toast.makeText(this@MainActivity, "準備聆聽...", Toast.LENGTH_SHORT).show()
-            }
-            override fun onBeginningOfSpeech() {
-                // 開始說話時
-                isSpeakingState.value = true
-                // 取消任何待處理的停頓檢測
-                pauseRunnable?.let { handler.removeCallbacks(it) }
-            }
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {
-                // 當檢測到語音結束時
-                isSpeakingState.value = false
-                
-                // 不要立即清空，讓用戶有時間看到最後的文字
-                // 只有當文字變化時才設置停頓檢測
-                if (currentTextState.value.isNotEmpty() && currentTextState.value != lastRecognizedText) {
-                    lastRecognizedText = currentTextState.value
-                    hasNewSentence = true
-                    
-                    // 設置停頓檢測
-                    pauseRunnable?.let { handler.removeCallbacks(it) }
-                    pauseRunnable = Runnable {
-                        if (hasNewSentence && currentTextState.value.isNotEmpty()) {
-                            // 不再清空當前文字，只標記為已處理
-                            hasNewSentence = false
-                            
-                            // 設置自動保存，確保最後一句話不會丟失
-                            autoSaveRunnable?.let { handler.removeCallbacks(it) }
-                            handler.postDelayed(autoSaveRunnable!!, AUTO_SAVE_DELAY)
-                        }
-                    }
-                    handler.postDelayed(pauseRunnable!!, PAUSE_DELAY)
-                }
-            }
-
-            override fun onError(error: Int) {
-                // 語音識別錯誤
-                isSpeakingState.value = false
-                
-                when (error) {
-                    SpeechRecognizer.ERROR_AUDIO -> Toast.makeText(this@MainActivity, "音頻錯誤", Toast.LENGTH_SHORT).show()
-                    SpeechRecognizer.ERROR_CLIENT -> Toast.makeText(this@MainActivity, "客戶端錯誤", Toast.LENGTH_SHORT).show()
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> Toast.makeText(this@MainActivity, "權限不足", Toast.LENGTH_SHORT).show()
-                    SpeechRecognizer.ERROR_NETWORK -> Toast.makeText(this@MainActivity, "網絡錯誤", Toast.LENGTH_SHORT).show()
-                    SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> Toast.makeText(this@MainActivity, "網絡超時", Toast.LENGTH_SHORT).show()
-                    SpeechRecognizer.ERROR_NO_MATCH -> Toast.makeText(this@MainActivity, "無匹配結果", Toast.LENGTH_SHORT).show()
-                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> Toast.makeText(this@MainActivity, "識別器忙", Toast.LENGTH_SHORT).show()
-                    SpeechRecognizer.ERROR_SERVER -> Toast.makeText(this@MainActivity, "服務器錯誤", Toast.LENGTH_SHORT).show()
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> Toast.makeText(this@MainActivity, "語音超時", Toast.LENGTH_SHORT).show()
-                    else -> Toast.makeText(this@MainActivity, "未知錯誤: $error", Toast.LENGTH_SHORT).show()
-                }
-                
-                if (error != SpeechRecognizer.ERROR_CLIENT && error != SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
-                    handler.postDelayed({
-                        speechRecognizer.cancel()
-                        isListening = false
-                        if (isListeningState.value) {
-                            startListening()
-                        }
-                    }, 500) 
-                } else if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
-                    speechRecognizer.cancel()
-                    isListening = false
-                    handler.postDelayed({
-                        if (isListeningState.value) {
-                            startListening()
-                        }
-                    }, 1000) 
-                }
-            }
-
-            override fun onResults(results: Bundle?) {
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!matches.isNullOrEmpty()) {
-                    val text = matches[0]
-                    if (text.isNotEmpty() && text != lastRecognizedText) {
-                        // 如果有新句子且當前有顯示文字，則將當前文字添加到歷史
-                        if (currentTextState.value.isNotEmpty() && currentTextState.value != text) {
-                            previousText = currentTextState.value
-                            
-                            // 直接添加到歷史記錄，不檢查重複
-                            // 因為我們已經確認這是新的句子，與當前顯示的不同
-                            addToHistory(previousText)
-                            
-                            // 強制更新UI
-                            handler.post {
-                                // 確保主線程更新UI
-                                val temp = historyTextState.toList()
-                                historyTextState.clear()
-                                historyTextState.addAll(temp)
-                            }
-                        }
-                        
-                        // 更新當前文字
-                        currentTextState.value = text
-                        lastRecognizedText = text
-                        hasNewSentence = true
-                        
-                        // 設置停頓檢測，但不立即清空
-                        pauseRunnable?.let { handler.removeCallbacks(it) }
-                        pauseRunnable = Runnable {
-                            if (hasNewSentence && currentTextState.value.isNotEmpty()) {
-                                // 不再清空當前文字，只標記為已處理
-                                hasNewSentence = false
-                                
-                                // 設置自動保存，確保最後一句話不會丟失
-                                autoSaveRunnable?.let { handler.removeCallbacks(it) }
-                                handler.postDelayed(autoSaveRunnable!!, AUTO_SAVE_DELAY)
-                            }
-                        }
-                        handler.postDelayed(pauseRunnable!!, PAUSE_DELAY)
-                    }
-                }
-                
-                isListening = false
-                if (isListeningState.value) {
-                    handler.postDelayed({
-                        startListening()
-                    }, 300) // 短暫延遲後重啟，避免連續啟動
-                }
-            }
-
-            override fun onPartialResults(partialResults: Bundle?) {
-                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!matches.isNullOrEmpty()) {
-                    val text = matches[0]
-                    if (text.isNotEmpty()) {
-                        // 更新當前文字
-                        currentTextState.value = text
-                        
-                        // 不在部分結果時設置停頓檢測，避免文字跳動
-                    }
-                }
-            }
-
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
-
         try {
-            speechRecognizer.cancel()
-            handler.postDelayed({
-                speechRecognizer.startListening(recognizerIntent)
-                isListening = true
-                Toast.makeText(this, "開始聆聽", Toast.LENGTH_SHORT).show()
-            }, 200) 
+            recognizer.startListening(intent)
+            recState = RecState.STARTING
         } catch (e: Exception) {
-            Toast.makeText(this, "語音辨識啟動失敗: ${e.message}", Toast.LENGTH_SHORT).show()
-            isListening = false
-            isListeningState.value = false
+            recState = RecState.IDLE
+            handleError(SpeechRecognizer.ERROR_CLIENT)
         }
     }
-    
-    private fun addToHistory(text: String) {
-        if (text.isNotEmpty()) {
-            // 檢查是否已經存在相同的文字，避免重複添加
-            if (!historyTextState.contains(text)) {
-                historyTextState.add(0, text)
-                if (historyTextState.size > 10) {
-                    historyTextState.removeAt(historyTextState.size - 1)
+
+    private val recognitionListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {
+            recState = RecState.LISTENING
+            viewModel.isListening = true
+            viewModel.errorMessage = null
+        }
+
+        override fun onBeginningOfSpeech() {
+            viewModel.isSpeaking = true
+        }
+
+        override fun onRmsChanged(rmsdB: Float) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastRmsHandledAt < RMS_THROTTLE_MS) return
+            lastRmsHandledAt = now
+            viewModel.rmsLevel = ((rmsdB + 2f) / 2.4f).toInt().coerceIn(0, 5)
+        }
+
+        override fun onBufferReceived(buffer: ByteArray?) {}
+
+        override fun onEndOfSpeech() {
+            viewModel.isSpeaking = false
+        }
+
+        override fun onError(error: Int) {
+            handleError(error)
+        }
+
+        override fun onResults(results: Bundle?) {
+            recState = RecState.IDLE
+            viewModel.isSpeaking = false
+            consecutiveErrors = 0
+            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+            if (!text.isNullOrBlank()) {
+                viewModel.finalizeSentence(text)
+            } else if (viewModel.partialText.isNotBlank()) {
+                viewModel.finalizeSentence(viewModel.partialText)
+            }
+            // 立即重啟，消除原本 cancel+200ms+300ms 造成的每句 500ms 收音空窗
+            if (viewModel.wantsListening) startListeningInternal()
+        }
+
+        override fun onPartialResults(partialResults: Bundle?) {
+            consecutiveErrors = 0
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastPartialHandledAt < PARTIAL_THROTTLE_MS) return
+            lastPartialHandledAt = now
+            val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+            if (!text.isNullOrBlank()) viewModel.updatePartial(text)
+        }
+
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+
+    /** 按錯誤種類分別處理：可恢復的重試、不可恢復的停止並顯示大字說明 */
+    private fun handleError(error: Int) {
+        recState = RecState.IDLE
+        viewModel.isSpeaking = false
+        if (!viewModel.wantsListening) return
+        when (error) {
+            SpeechRecognizer.ERROR_NO_MATCH,
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                // 一段時間沒人說話是常態，直接重啟繼續聽
+                consecutiveErrors = 0
+                startListeningInternal()
+            }
+
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
+                try { speechRecognizer?.cancel() } catch (_: Exception) {}
+                scheduleRestart(500)
+            }
+
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> stopWithError(
+                UiError(
+                    message = "需要麥克風權限，才能聽到聲音變成字幕",
+                    actionLabel = "去開啟權限",
+                    action = ErrorAction.OPEN_SETTINGS,
+                )
+            )
+
+            SpeechRecognizer.ERROR_NETWORK,
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
+            SpeechRecognizer.ERROR_SERVER -> {
+                consecutiveErrors++
+                if (consecutiveErrors <= MAX_NETWORK_RETRIES) {
+                    val backoff = (1000L shl (consecutiveErrors - 1)).coerceAtMost(8000L)
+                    scheduleRestart(backoff)
+                } else {
+                    stopWithError(
+                        UiError(
+                            message = "沒有網路，暫時聽不到。請確認網路後再試一次",
+                            actionLabel = "重試",
+                            action = ErrorAction.RETRY,
+                        )
+                    )
+                }
+            }
+
+            else -> {
+                // ERROR_CLIENT、ERROR_AUDIO 等：重試少數幾次後放棄並明確告知
+                consecutiveErrors++
+                if (consecutiveErrors <= MAX_CLIENT_RETRIES) {
+                    scheduleRestart(300)
+                } else {
+                    stopWithError(
+                        UiError(
+                            message = "語音辨識出了問題，請再按一次「開始聆聽」",
+                            actionLabel = "重試",
+                            action = ErrorAction.RETRY,
+                        )
+                    )
                 }
             }
         }
     }
 
-    private fun stopListening() {
-        if (isListening) {
-            speechRecognizer.stopListening()
-            isListening = false
-            isSpeakingState.value = false
-            
-            // 停止聆聽時不立即添加到歷史，但設置自動保存
-            if (currentTextState.value.isNotEmpty()) {
-                // 設置自動保存，確保最後一句話不會丟失
-                autoSaveRunnable?.let { handler.removeCallbacks(it) }
-                handler.postDelayed(autoSaveRunnable!!, AUTO_SAVE_DELAY)
-                hasNewSentence = false
-            }
-            
-            pauseRunnable?.let { handler.removeCallbacks(it) }
+    // ---- 生命週期 ----
+
+    override fun onStart() {
+        super.onStart()
+        // 回到前景：若使用者先前在聆聽，自動續聽
+        if (viewModel.wantsListening && recState == RecState.IDLE && hasMicPermission()) {
+            startListeningInternal()
         }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // 進背景：停止引擎與所有排程重試（Android 9+ 背景不能收音，避免無限重試空轉）
+        // 保留 wantsListening，回前景自動續聽
+        handler.removeCallbacksAndMessages(null)
+        if (recState != RecState.IDLE) {
+            try { speechRecognizer?.cancel() } catch (_: Exception) {}
+            recState = RecState.IDLE
+        }
+        viewModel.isListening = false
+        viewModel.isSpeaking = false
+        viewModel.rmsLevel = 0
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        try { speechRecognizer?.setRecognitionListener(null) } catch (_: Exception) {}
+        try { speechRecognizer?.destroy() } catch (_: Exception) {}
+        speechRecognizer = null
+        super.onDestroy()
+    }
+
+    private fun openAppSettings() {
+        startActivity(
+            Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", packageName, null)
+            )
+        )
     }
 }
 
+// ============================== UI ==============================
+
 @Composable
-fun HearingAidApp(
+fun HearingScreen(
     modifier: Modifier = Modifier,
+    vm: HearingViewModel,
     onStartListening: () -> Unit,
     onStopListening: () -> Unit,
-    onAddToHistory: () -> Unit,
-    onClearHistory: () -> Unit, // 新增清除歷史的回調
-    currentText: String,
-    textHistory: List<String>,
-    isListening: Boolean,
-    isSpeaking: Boolean
+    onErrorAction: (ErrorAction) -> Unit,
 ) {
-    val scrollState = rememberScrollState()
-    val localDensity = LocalDensity.current
+    val isDark = isSystemInDarkTheme()
+    // 高對比操作色（過 WCAG AA）：綠=開始/正常、紅=停止/說話中
+    val actionGreen = if (isDark) Color(0xFFA5D6A7) else Color(0xFF1B5E20)
+    val onActionGreen = if (isDark) Color(0xFF0D3B12) else Color.White
+    val stopRed = if (isDark) Color(0xFFF2B8B5) else Color(0xFFB3261E)
+    val onStopRed = if (isDark) Color(0xFF601410) else Color.White
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        // App title and clear button row
+    var showClearDialog by remember { mutableStateOf(false) }
+    var lastActionAt by remember { mutableStateOf(0L) }
+
+    Column(modifier = modifier.fillMaxSize()) {
+
+        // ---- 頂列：清除 + 字級調整 ----
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                text = "老人助聽器",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold
-            )
-            
-            // 清除歷史按鈕
-            if (textHistory.isNotEmpty()) {
-                Button(
-                    onClick = onClearHistory,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFFE57373) // 淺紅色
-                    ),
-                    modifier = Modifier.padding(start = 8.dp)
+            if (vm.captions.isNotEmpty() || vm.partialText.isNotBlank()) {
+                OutlinedButton(
+                    onClick = { showClearDialog = true },
+                    modifier = Modifier.heightIn(min = 48.dp),
                 ) {
-                    Text("清除記錄")
+                    Text("清除", fontSize = 20.sp)
                 }
+            }
+            Spacer(modifier = Modifier.weight(1f))
+            OutlinedButton(
+                onClick = { vm.decreaseFont() },
+                enabled = vm.fontSizeSp > HearingViewModel.MIN_FONT_SP,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text("字小", fontSize = 20.sp)
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            OutlinedButton(
+                onClick = { vm.increaseFont() },
+                enabled = vm.fontSizeSp < HearingViewModel.MAX_FONT_SP,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text("字大", fontSize = 20.sp)
             }
         }
 
-        // 重新設計佈局，確保當前文字始終在上方
-        Box(
+        // ---- 狀態列：狀態燈 + 文字 + 音量條（不只靠顏色傳達狀態） ----
+        Row(
             modifier = Modifier
-                .weight(1f)
                 .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column(
+            val statusColor = when {
+                !vm.wantsListening -> MaterialTheme.colorScheme.outline
+                vm.isSpeaking -> stopRed
+                vm.isListening -> actionGreen
+                else -> MaterialTheme.colorScheme.outline
+            }
+            Box(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(scrollState),
-                horizontalAlignment = Alignment.CenterHorizontally
+                    .size(14.dp)
+                    .background(statusColor, CircleShape)
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Text(
+                text = when {
+                    !vm.wantsListening -> "已停止"
+                    vm.isSpeaking -> "有聽到聲音…"
+                    vm.isListening -> "正在聽…"
+                    else -> "準備中…"
+                },
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            RmsBars(level = vm.rmsLevel, active = vm.isListening, activeColor = actionGreen)
+        }
+
+        // ---- 錯誤訊息（畫面大字，取代 Toast 與靜默失敗） ----
+        vm.errorMessage?.let { err ->
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.errorContainer,
             ) {
-                // 始終將當前文字放在頂部
-                if (currentText.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(16.dp))
-                    
+                Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = currentText,
-                        fontSize = 32.sp,
+                        text = err.message,
+                        fontSize = 22.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF2196F3), // Blue color
-                        textAlign = TextAlign.Center,
-                        lineHeight = 48.sp, // 增加行高，避免文字疊在一起
-                        modifier = Modifier
-                            .padding(horizontal = 16.dp, vertical = 24.dp) // 增加垂直間距
-                            .fillMaxWidth()
+                        lineHeight = 30.sp,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
                     )
-                    
-                    Spacer(modifier = Modifier.height(32.dp))
-                } else if (isListening) {
-                    // 顯示提示文字，也放在頂部
-                    Spacer(modifier = Modifier.height(16.dp))
-                    
-                    Text(
-                        text = if (isSpeaking) "正在聆聽..." else "請開始說話...",
-                        fontSize = 24.sp,
-                        color = if (isSpeaking) Color(0xFF4CAF50) else Color.Gray, // 說話時顯示綠色
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier
-                            .padding(16.dp)
-                            .fillMaxWidth()
-                    )
-                    
-                    Spacer(modifier = Modifier.height(32.dp))
-                } else {
-                    // 顯示未啟用提示，也放在頂部
-                    Spacer(modifier = Modifier.height(16.dp))
-                    
-                    Text(
-                        text = "點擊下方按鈕開始聆聽",
-                        fontSize = 24.sp,
-                        color = Color.Gray,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier
-                            .padding(16.dp)
-                            .fillMaxWidth()
-                    )
-                    
-                    Spacer(modifier = Modifier.height(32.dp))
-                }
-                
-                // 歷史記錄放在當前文字下方
-                if (textHistory.isNotEmpty()) {
-                    Text(
-                        text = "歷史記錄",
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.DarkGray,
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
-                    
-                    textHistory.forEach { text ->
-                        Text(
-                            text = text,
-                            fontSize = 18.sp,
-                            color = Color.Gray,
-                            textAlign = TextAlign.Center,
-                            lineHeight = 28.sp, // 增加歷史記錄的行高
-                            modifier = Modifier
-                                .padding(vertical = 8.dp) // 增加垂直間距
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp)
-                        )
+                    if (err.actionLabel != null) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(
+                            onClick = { onErrorAction(err.action) },
+                            modifier = Modifier.heightIn(min = 56.dp),
+                        ) {
+                            Text(err.actionLabel, fontSize = 20.sp)
+                        }
                     }
                 }
-                
-                // 確保底部有足夠空間
-                Spacer(modifier = Modifier.height(32.dp))
             }
         }
 
-        // Control button
+        // ---- 字幕流（新句在底部，自動捲動；上滑閱讀時暫停並顯示「回到最新」） ----
+        Box(modifier = Modifier.weight(1f)) {
+            val listState = rememberLazyListState()
+            val scope = rememberCoroutineScope()
+            val totalCount = vm.captions.size + if (vm.partialText.isNotBlank()) 1 else 0
+
+            val nearBottom by remember {
+                derivedStateOf {
+                    val info = listState.layoutInfo
+                    val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+                    lastVisible >= info.totalItemsCount - 2
+                }
+            }
+
+            LaunchedEffect(vm.captions.size, vm.partialText) {
+                if (totalCount > 0 && nearBottom) {
+                    listState.animateScrollToItem(totalCount - 1)
+                }
+            }
+
+            if (totalCount == 0 && vm.errorMessage == null) {
+                Text(
+                    text = if (vm.wantsListening) "正在聽，請說話…" else "按下面的綠色按鈕，開始聽",
+                    fontSize = 26.sp,
+                    lineHeight = 36.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .padding(horizontal = 32.dp),
+                )
+            }
+
+            val timeFormat = remember { SimpleDateFormat("a h:mm", Locale.TAIWAN) }
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 16.dp),
+            ) {
+                itemsIndexed(vm.captions, key = { _, e -> e.id }) { index, entry ->
+                    val showTime = index == 0 ||
+                        minuteOf(vm.captions[index - 1].timeMillis) != minuteOf(entry.timeMillis)
+                    if (showTime) {
+                        Text(
+                            text = timeFormat.format(Date(entry.timeMillis)),
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 12.dp, bottom = 2.dp),
+                        )
+                    }
+                    Text(
+                        text = entry.text,
+                        fontSize = vm.fontSizeSp.sp,
+                        lineHeight = (vm.fontSizeSp * 1.4f).sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 6.dp),
+                    )
+                }
+                if (vm.partialText.isNotBlank()) {
+                    item(key = "partial") {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(IntrinsicSize.Min)
+                                .padding(vertical = 6.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .width(4.dp)
+                                    .fillMaxHeight()
+                                    .background(
+                                        MaterialTheme.colorScheme.primary,
+                                        RoundedCornerShape(2.dp)
+                                    )
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = vm.partialText + "…",
+                                fontSize = vm.fontSizeSp.sp,
+                                lineHeight = (vm.fontSizeSp * 1.4f).sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (totalCount > 0 && !nearBottom) {
+                Button(
+                    onClick = { scope.launch { listState.scrollToItem(totalCount - 1) } },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 12.dp)
+                        .heightIn(min = 56.dp),
+                ) {
+                    Text("↓ 回到最新", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+
+        // ---- 開始/停止大按鈕（96dp，高齡觸控目標） ----
         Button(
             onClick = {
-                if (isListening) {
-                    onStopListening()
-                } else {
-                    onStartListening()
-                }
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastActionAt < 600) return@Button // 防連點
+                lastActionAt = now
+                if (vm.wantsListening) onStopListening() else onStartListening()
             },
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (isListening) Color(0xFFE57373) else Color(0xFF4CAF50) // 停止聆聽為紅色，開始聆聽為綠色
+                containerColor = if (vm.wantsListening) stopRed else actionGreen,
+                contentColor = if (vm.wantsListening) onStopRed else onActionGreen,
             ),
+            shape = RoundedCornerShape(20.dp),
             modifier = Modifier
-                .padding(16.dp)
-                .height(56.dp)
                 .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 16.dp)
+                .heightIn(min = 96.dp),
         ) {
             Text(
-                text = if (isListening) "停止聆聽" else "開始聆聽",
-                fontSize = 18.sp
+                text = if (vm.wantsListening) "■ 停止" else "▶ 開始聆聽",
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Bold,
             )
         }
     }
 
-    // 當有新內容時，自動滾動到頂部
-    LaunchedEffect(currentText, textHistory.size) {
-        scrollState.scrollTo(0)
+    // ---- 清除確認對話框（防誤觸一鍵全毀） ----
+    if (showClearDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearDialog = false },
+            title = {
+                Text("確定要清除所有字幕嗎？", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Text("清除後就看不到之前的內容了", fontSize = 18.sp, lineHeight = 26.sp)
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        vm.clearAll()
+                        showClearDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError,
+                    ),
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Text("清除", fontSize = 20.sp)
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = { showClearDialog = false },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Text("取消", fontSize = 20.sp)
+                }
+            },
+        )
     }
+}
 
-    // Update the UI when speech recognition results come in
-    DisposableEffect(key1 = Unit) {
-        onDispose {
-            onStopListening()
+/** 音量條：5 格，依 RMS 等級點亮 */
+@Composable
+private fun RmsBars(level: Int, active: Boolean, activeColor: Color) {
+    Row(verticalAlignment = Alignment.Bottom) {
+        val heights = listOf(8, 12, 16, 20, 24)
+        heights.forEachIndexed { i, h ->
+            Box(
+                modifier = Modifier
+                    .padding(horizontal = 2.dp)
+                    .width(8.dp)
+                    .height(h.dp)
+                    .background(
+                        if (active && level > i) activeColor
+                        else MaterialTheme.colorScheme.outlineVariant,
+                        RoundedCornerShape(2.dp)
+                    )
+            )
         }
     }
 }
 
-@Preview(showBackground = true)
-@Composable
-fun HearingAidAppPreview() {
-    HearingAid0411Theme {
-        HearingAidApp(
-            onStartListening = {},
-            onStopListening = {},
-            onAddToHistory = {},
-            onClearHistory = {},
-            currentText = "預覽文字",
-            textHistory = listOf("歷史文字1", "歷史文字2", "歷史文字3"),
-            isListening = true,
-            isSpeaking = false
-        )
-    }
+private fun minuteOf(timeMillis: Long): Long {
+    val cal = Calendar.getInstance()
+    cal.timeInMillis = timeMillis
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    return cal.timeInMillis
 }
