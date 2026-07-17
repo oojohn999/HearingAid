@@ -54,6 +54,12 @@ dependencies {
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
     ksp(libs.androidx.room.compiler)
+
+    // 離線中文語音辨識（官方無 Maven 發佈；AAR 從 GitHub release 下載到 app/libs：
+    // https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar）
+    implementation(files("libs/sherpa-onnx-1.13.4.aar"))
+    // 簡體→台灣繁體（含台灣用語詞彙級轉換），純 Java、Apache-2.0
+    implementation("com.github.houbb:opencc4j:1.14.0")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

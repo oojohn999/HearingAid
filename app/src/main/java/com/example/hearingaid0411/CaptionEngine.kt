@@ -10,15 +10,22 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 
+/** 字幕辨識引擎的共同介面（SpeechRecognizer 備援與 sherpa-onnx 離線引擎可互換） */
+interface AsrEngine {
+    fun start()
+    fun stop()
+    fun destroy()
+}
+
 /**
- * 語音辨識引擎：連續聆聽的狀態機、錯誤分類重試、partial/final 分流。
- * 只能在主執行緒操作（SpeechRecognizer 的要求）。
+ * 語音辨識引擎（系統 SpeechRecognizer 備援版）：連續聆聽的狀態機、
+ * 錯誤分類重試、partial/final 分流。只能在主執行緒操作。
  * 定稿句子透過 [onFinal] 回呼交給呼叫端（服務）處理持久化。
  */
 class CaptionEngine(
     private val context: Context,
     private val onFinal: (String) -> Unit,
-) {
+) : AsrEngine {
     private enum class RecState { IDLE, STARTING, LISTENING }
 
     private var speechRecognizer: SpeechRecognizer? = null
@@ -36,12 +43,12 @@ class CaptionEngine(
     }
 
     /** 開始（或恢復）聆聽。前置條件：RECORD_AUDIO 已授權、HearingState.wantsListening 已設 true */
-    fun start() {
+    override fun start() {
         startInternal()
     }
 
     /** 使用者主動停止：清排程、取消辨識、保留未定稿文字 */
-    fun stop() {
+    override fun stop() {
         handler.removeCallbacksAndMessages(null)
         cancelRecognizer()
         HearingState.isListening = false
@@ -52,7 +59,7 @@ class CaptionEngine(
         }
     }
 
-    fun destroy() {
+    override fun destroy() {
         handler.removeCallbacksAndMessages(null)
         try { speechRecognizer?.setRecognitionListener(null) } catch (_: Exception) {}
         try { speechRecognizer?.destroy() } catch (_: Exception) {}

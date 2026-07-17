@@ -9,6 +9,10 @@ import android.content.pm.ServiceInfo
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.example.hearingaid0411.asr.SherpaCaptionEngine
+import com.example.hearingaid0411.asr.SherpaModelLocator
+import com.example.hearingaid0411.audio.AmpSink
+import com.example.hearingaid0411.audio.AudioEngine
 import com.example.hearingaid0411.data.AppDb
 import com.example.hearingaid0411.data.CaptionDao
 import com.example.hearingaid0411.data.CaptionRow
@@ -22,10 +26,14 @@ import kotlinx.coroutines.launch
 import java.util.Calendar
 
 /**
- * 前景服務（microphone 類型）：持有辨識引擎與擴音通路，
+ * 前景服務（microphone 類型）：持有辨識引擎、共享音源與擴音通路，
  * 讓熄屏/切到背景後字幕與擴音持續運作；並把定稿句子寫入 Room（對話紀錄）。
  *
- * Android 14+ 規則：此服務只能在 App 於前景時啟動（使用者按「開始聆聽」）。
+ * 引擎自動選擇：
+ * - 裝置上有 sherpa 離線模型 → SherpaCaptionEngine（單一麥克風分流，
+ *   擴音與字幕真正同時、離線可用、輸出台灣繁體）
+ * - 沒有模型 → CaptionEngine（系統 SpeechRecognizer 備援；擴音與字幕
+ *   同開時受 Android 麥克風併發政策影響，行為依機型而異）
  */
 class HearingService : Service() {
 
@@ -45,10 +53,12 @@ class HearingService : Service() {
         private const val RETENTION_DAYS = 30
     }
 
-    private lateinit var engine: CaptionEngine
+    private lateinit var asr: AsrEngine
+    private var sherpaMode = false
+    private val audioEngine = AudioEngine()
+    private val ampSink = AmpSink()
     private lateinit var routeMonitor: RouteMonitor
     private lateinit var dao: CaptionDao
-    private val amp = AmpEngine()
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private val dbScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
@@ -60,7 +70,16 @@ class HearingService : Service() {
         super.onCreate()
         HearingState.init(this)
         dao = AppDb.get(this).dao()
-        engine = CaptionEngine(this) { text -> onFinalSentence(text) }
+
+        val model = SherpaModelLocator.find(this)
+        sherpaMode = model != null
+        asr = if (model != null) {
+            SherpaCaptionEngine.prewarmOpenCc()
+            SherpaCaptionEngine(model, audioEngine) { text -> onFinalSentence(text) }
+        } else {
+            CaptionEngine(this) { text -> onFinalSentence(text) }
+        }
+
         routeMonitor = RouteMonitor(this).apply {
             onHeadsetLost = {
                 if (HearingState.ampRunning || HearingState.ampWanted) {
@@ -95,11 +114,24 @@ class HearingService : Service() {
 
             ACTION_AMP_OFF -> stopAmp()
 
-            else -> { // ACTION_START 或 null（系統重啟服務）
+            else -> { // ACTION_START
                 startAsForeground()
                 HearingState.wantsListening = true
                 HearingState.errorMessage = null
-                engine.start()
+                if (sherpaMode) {
+                    if (audioEngine.start()) {
+                        asr.start()
+                    } else {
+                        HearingState.wantsListening = false
+                        HearingState.errorMessage = UiError(
+                            message = "麥克風開啟失敗，請再試一次",
+                            actionLabel = "重試",
+                            action = ErrorAction.RETRY,
+                        )
+                    }
+                } else {
+                    asr.start()
+                }
             }
         }
         return START_NOT_STICKY
@@ -109,7 +141,7 @@ class HearingService : Service() {
 
     override fun onDestroy() {
         stopEverything()
-        engine.destroy()
+        asr.destroy()
         routeMonitor.stop()
         dbScope.cancel()
         super.onDestroy()
@@ -139,7 +171,7 @@ class HearingService : Service() {
         lastSentenceAt = now
     }
 
-    // ---- 擴音 ----
+    // ---- 擴音（掛在共享音源上） ----
 
     private fun startAmp() {
         if (HearingState.headsetRoute == HeadsetRoute.NONE) {
@@ -149,10 +181,15 @@ class HearingService : Service() {
             return
         }
         HearingState.ampWanted = true
-        val ok = amp.start()
-        HearingState.ampRunning = ok
-        if (!ok) {
+        val micOk = audioEngine.start()
+        val trackOk = micOk && ampSink.open()
+        if (trackOk) {
+            audioEngine.addSink(ampSink)
+            HearingState.ampRunning = true
+        } else {
             HearingState.ampWanted = false
+            HearingState.ampRunning = false
+            if (!sherpaMode && !audioEngineNeeded()) audioEngine.stop()
             HearingState.errorMessage = UiError(
                 message = "擴音開啟失敗（麥克風可能被其他功能占用），請再試一次",
                 actionLabel = "知道了",
@@ -164,13 +201,24 @@ class HearingService : Service() {
     private fun stopAmp() {
         HearingState.ampWanted = false
         HearingState.ampRunning = false
-        amp.stop()
+        audioEngine.removeSink(ampSink)
+        ampSink.close()
+        // 備援模式下音源只服務擴音；擴音關了就釋放麥克風
+        if (!audioEngineNeeded()) audioEngine.stop()
     }
+
+    /** 共享音源目前是否還有人在用 */
+    private fun audioEngineNeeded(): Boolean =
+        (sherpaMode && HearingState.wantsListening) || HearingState.ampRunning
 
     private fun stopEverything() {
         HearingState.wantsListening = false
-        engine.stop()
-        stopAmp()
+        asr.stop()
+        HearingState.ampWanted = false
+        HearingState.ampRunning = false
+        audioEngine.removeSink(ampSink)
+        ampSink.close()
+        audioEngine.stop()
     }
 
     // ---- 前景通知 ----
@@ -197,7 +245,7 @@ class HearingService : Service() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentTitle("輔聽字幕運作中")
-            .setContentText("正在聽聲音並顯示字幕")
+            .setContentText(if (sherpaMode) "正在聽聲音並顯示字幕（離線模式）" else "正在聽聲音並顯示字幕")
             .setContentIntent(openIntent)
             .addAction(0, "停止", stopIntent)
             .setOngoing(true)
