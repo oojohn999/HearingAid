@@ -90,6 +90,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         HearingState.init(this)
+        HearingState.offlineModelReady =
+            com.example.hearingaid0411.asr.SherpaModelLocator.find(this) != null
         enableEdgeToEdge()
 
         setContent {
@@ -301,6 +303,9 @@ fun HearingScreen(
             Spacer(modifier = Modifier.weight(1f))
             RmsBars(level = st.rmsLevel, active = st.isListening, activeColor = actionGreen)
         }
+
+        // ---- 離線字幕下載卡 ----
+        ModelDownloadCard()
 
         // ---- 錯誤/提示訊息 ----
         st.errorMessage?.let { err ->
@@ -598,6 +603,133 @@ fun HearingScreen(
                 }
             },
         )
+    }
+}
+
+/** 離線字幕模型下載卡：未安裝→邀請下載；下載中→進度條；完成/失敗→提示 */
+@Composable
+private fun ModelDownloadCard() {
+    val st = HearingState
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val dl = st.modelDownload
+
+    // 已就緒且沒有待顯示的完成訊息 → 不佔畫面
+    if (st.offlineModelReady && dl !is com.example.hearingaid0411.asr.ModelDownloadState.Done) return
+    if (!st.offlineModelReady && dl == null && st.modelBannerDismissed) return
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer,
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            when (dl) {
+                is com.example.hearingaid0411.asr.ModelDownloadState.InProgress -> {
+                    val percent = (dl.progress * 100).toInt()
+                    Text(
+                        text = "正在下載離線字幕… $percent%",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    androidx.compose.material3.LinearProgressIndicator(
+                        progress = { dl.progress },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(10.dp),
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "下載時請不要關閉 App",
+                        fontSize = 16.sp,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                }
+
+                is com.example.hearingaid0411.asr.ModelDownloadState.Done -> {
+                    Text(
+                        text = "離線字幕安裝完成！",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                    Text(
+                        text = "下次按「開始聆聽」就會使用，沒有網路也能看字幕",
+                        fontSize = 16.sp,
+                        lineHeight = 24.sp,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Button(
+                        onClick = { st.modelDownload = null },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Text("知道了", fontSize = 18.sp)
+                    }
+                }
+
+                is com.example.hearingaid0411.asr.ModelDownloadState.Failed -> {
+                    Text(
+                        text = "下載失敗，請檢查網路後再試",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row {
+                        Button(
+                            onClick = { com.example.hearingaid0411.asr.ModelDownloader.start(context) },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) {
+                            Text("重試", fontSize = 18.sp)
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        OutlinedButton(
+                            onClick = { st.modelDownload = null },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) {
+                            Text("先不要", fontSize = 18.sp)
+                        }
+                    }
+                }
+
+                null -> {
+                    Text(
+                        text = "安裝離線字幕（約 76 MB）",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                    Text(
+                        text = "裝了以後沒有網路也能看字幕，建議在 Wi-Fi 環境下載",
+                        fontSize = 16.sp,
+                        lineHeight = 24.sp,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row {
+                        Button(
+                            onClick = { com.example.hearingaid0411.asr.ModelDownloader.start(context) },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) {
+                            Text("下載", fontSize = 18.sp)
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        OutlinedButton(
+                            onClick = { st.modelBannerDismissed = true },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) {
+                            Text("先不要", fontSize = 18.sp)
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

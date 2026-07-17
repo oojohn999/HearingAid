@@ -68,6 +68,15 @@ object HearingState {
 
     var headsetRoute by mutableStateOf(HeadsetRoute.NONE)
 
+    /** 離線辨識模型是否已就緒（App 啟動與下載完成時更新） */
+    var offlineModelReady by mutableStateOf(false)
+
+    /** 模型下載狀態（null = 尚未開始） */
+    var modelDownload by mutableStateOf<com.example.hearingaid0411.asr.ModelDownloadState?>(null)
+
+    /** 本次啟動中使用者按了「先不要」隱藏下載卡片 */
+    var modelBannerDismissed by mutableStateOf(false)
+
     var fontSizeSp by mutableStateOf(DEFAULT_FONT_SP)
         private set
 
