@@ -219,12 +219,14 @@ fun DetailScreen(
                         modifier = Modifier.padding(top = 12.dp, bottom = 2.dp),
                     )
                 }
+                val fs = if (row.isSelf) fontSize * 0.85f else fontSize
                 Text(
-                    text = row.text,
-                    fontSize = fontSize.sp,
-                    lineHeight = (fontSize * 1.4f).sp,
+                    text = if (row.isSelf) "（我）${row.text}" else row.text,
+                    fontSize = fs.sp,
+                    lineHeight = (fs * 1.4f).sp,
                     fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.onBackground,
+                    color = if (row.isSelf) MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.onBackground,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 6.dp),

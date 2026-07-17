@@ -11,11 +11,12 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
-/** 一句已定稿的字幕，含時間戳（對話紀錄回看用） */
+/** 一句已定稿的字幕，含時間戳（對話紀錄回看用）與「自己說的」標記 */
 data class CaptionEntry(
     val id: Long,
     val text: String,
     val timeMillis: Long,
+    val isSelf: Boolean = false,
 )
 
 /** 顯示在畫面上的錯誤/提示訊息（取代 Toast 與靜默失敗） */
@@ -114,12 +115,12 @@ object HearingState {
     }
 
     /** 定稿一句話；回傳新增的項目（若因重複被略過則回傳 null） */
-    fun finalizeSentence(text: String): CaptionEntry? {
+    fun finalizeSentence(text: String, isSelf: Boolean = false): CaptionEntry? {
         val t = text.trim()
         partialText = ""
         if (t.isEmpty()) return null
         if (captions.lastOrNull()?.text == t) return null
-        val entry = CaptionEntry(nextId++, t, System.currentTimeMillis())
+        val entry = CaptionEntry(nextId++, t, System.currentTimeMillis(), isSelf)
         captions.add(entry)
         while (captions.size > MAX_CAPTIONS) captions.removeAt(0)
         return entry

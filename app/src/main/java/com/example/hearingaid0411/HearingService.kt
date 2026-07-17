@@ -11,6 +11,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.example.hearingaid0411.asr.SherpaCaptionEngine
 import com.example.hearingaid0411.asr.SherpaModelLocator
+import com.example.hearingaid0411.asr.SpeakerIdentifier
+import com.example.hearingaid0411.asr.VoiceprintStore
 import com.example.hearingaid0411.audio.AmpSink
 import com.example.hearingaid0411.audio.AudioEngine
 import com.example.hearingaid0411.data.AppDb
@@ -55,6 +57,7 @@ class HearingService : Service() {
 
     private lateinit var asr: AsrEngine
     private var sherpaMode = false
+    private var speakerId: SpeakerIdentifier? = null
     private val audioEngine = AudioEngine()
     private val ampSink = AmpSink()
     private lateinit var routeMonitor: RouteMonitor
@@ -75,9 +78,24 @@ class HearingService : Service() {
         sherpaMode = model != null
         asr = if (model != null) {
             SherpaCaptionEngine.prewarmOpenCc()
-            SherpaCaptionEngine(model, audioEngine) { text -> onFinalSentence(text) }
+            // 聲紋（若已註冊且模型就緒）：判定每句是否為「自己」說的
+            speakerId = try {
+                if (VoiceprintStore.modelReady(this) && VoiceprintStore.isEnrolled(this)) {
+                    SpeakerIdentifier(
+                        VoiceprintStore.modelFile(this).absolutePath,
+                        VoiceprintStore.load(this),
+                    )
+                } else null
+            } catch (_: Throwable) {
+                null
+            }
+            SherpaCaptionEngine(
+                model,
+                audioEngine,
+                identifySelf = speakerId?.let { id -> { samples -> id.isSelf(samples) } },
+            ) { text, isSelf -> onFinalSentence(text, isSelf) }
         } else {
-            CaptionEngine(this) { text -> onFinalSentence(text) }
+            CaptionEngine(this) { text -> onFinalSentence(text, false) }
         }
 
         routeMonitor = RouteMonitor(this).apply {
@@ -142,6 +160,8 @@ class HearingService : Service() {
     override fun onDestroy() {
         stopEverything()
         asr.destroy()
+        speakerId?.release()
+        speakerId = null
         routeMonitor.stop()
         dbScope.cancel()
         super.onDestroy()
@@ -149,12 +169,17 @@ class HearingService : Service() {
 
     // ---- 字幕定稿 → 記憶體 + Room 持久化（含場次切分） ----
 
-    private fun onFinalSentence(text: String) {
-        val entry = HearingState.finalizeSentence(text) ?: return
+    private fun onFinalSentence(text: String, isSelf: Boolean) {
+        val entry = HearingState.finalizeSentence(text, isSelf) ?: return
         dbScope.launch {
             ensureSession(entry.timeMillis)
             dao.insertCaption(
-                CaptionRow(sessionId = currentSessionId, text = entry.text, timeMillis = entry.timeMillis)
+                CaptionRow(
+                    sessionId = currentSessionId,
+                    text = entry.text,
+                    timeMillis = entry.timeMillis,
+                    isSelf = entry.isSelf,
+                )
             )
             dao.updateSessionEnd(currentSessionId, entry.timeMillis)
         }

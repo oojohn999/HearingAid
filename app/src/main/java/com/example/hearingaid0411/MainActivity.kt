@@ -67,6 +67,8 @@ sealed interface Screen {
     data object Dates : Screen
     data class Sessions(val date: String) : Screen
     data class Detail(val date: String, val sessionId: Long, val title: String) : Screen
+    data object Settings : Screen
+    data object Voiceprint : Screen
 }
 
 class MainActivity : ComponentActivity() {
@@ -106,6 +108,7 @@ class MainActivity : ComponentActivity() {
                     screen = when (val s = screen) {
                         is Screen.Detail -> Screen.Sessions(s.date)
                         is Screen.Sessions -> Screen.Dates
+                        Screen.Voiceprint -> Screen.Settings
                         else -> Screen.Main
                     }
                 }
@@ -118,6 +121,7 @@ class MainActivity : ComponentActivity() {
                             onStopListening = { onUserStop() },
                             onToggleAmp = { onToggleAmp() },
                             onOpenHistory = { screen = Screen.Dates },
+                            onOpenSettings = { screen = Screen.Settings },
                             onErrorAction = { action ->
                                 when (action) {
                                     ErrorAction.OPEN_SETTINGS -> openAppSettings()
@@ -154,6 +158,17 @@ class MainActivity : ComponentActivity() {
                             sessionId = s.sessionId,
                             title = s.title,
                             onBack = { screen = Screen.Sessions(s.date) },
+                        )
+
+                        Screen.Settings -> SettingsScreen(
+                            modifier = Modifier.padding(innerPadding),
+                            onBack = { screen = Screen.Main },
+                            onOpenVoiceprint = { screen = Screen.Voiceprint },
+                        )
+
+                        Screen.Voiceprint -> VoiceprintScreen(
+                            modifier = Modifier.padding(innerPadding),
+                            onBack = { screen = Screen.Settings },
                         )
                     }
                 }
@@ -215,6 +230,7 @@ fun HearingScreen(
     onStopListening: () -> Unit,
     onToggleAmp: () -> Unit,
     onOpenHistory: () -> Unit,
+    onOpenSettings: () -> Unit,
     onErrorAction: (ErrorAction) -> Unit,
 ) {
     val st = HearingState
@@ -242,6 +258,13 @@ fun HearingScreen(
                 modifier = Modifier.heightIn(min = 48.dp),
             ) {
                 Text("紀錄", fontSize = 20.sp)
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            OutlinedButton(
+                onClick = onOpenSettings,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text("設定", fontSize = 20.sp)
             }
             Spacer(modifier = Modifier.width(12.dp))
             if (st.captions.isNotEmpty() || st.partialText.isNotBlank()) {
@@ -385,12 +408,14 @@ fun HearingScreen(
                             modifier = Modifier.padding(top = 12.dp, bottom = 2.dp),
                         )
                     }
+                    val fs = if (entry.isSelf) st.fontSizeSp * 0.85f else st.fontSizeSp
                     Text(
-                        text = entry.text,
-                        fontSize = st.fontSizeSp.sp,
-                        lineHeight = (st.fontSizeSp * 1.4f).sp,
+                        text = if (entry.isSelf) "（我）${entry.text}" else entry.text,
+                        fontSize = fs.sp,
+                        lineHeight = (fs * 1.4f).sp,
                         fontWeight = FontWeight.Medium,
-                        color = MaterialTheme.colorScheme.onBackground,
+                        color = if (entry.isSelf) MaterialTheme.colorScheme.onSurfaceVariant
+                        else MaterialTheme.colorScheme.onBackground,
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(vertical = 6.dp),

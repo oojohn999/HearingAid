@@ -21,13 +21,14 @@ data class SessionEntity(
     val endedAt: Long,
 )
 
-/** 一句字幕，屬於某個場次 */
+/** 一句字幕，屬於某個場次；isSelf = 聲紋判定為「自己說的」 */
 @Entity(tableName = "captions")
 data class CaptionRow(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val sessionId: Long,
     val text: String,
     val timeMillis: Long,
+    val isSelf: Boolean = false,
 )
 
 data class DateSummary(val date: String, val sessionCount: Int)
@@ -77,7 +78,7 @@ interface CaptionDao {
     suspend fun deleteSessionsBefore(minDate: String)
 }
 
-@Database(entities = [SessionEntity::class, CaptionRow::class], version = 1, exportSchema = false)
+@Database(entities = [SessionEntity::class, CaptionRow::class], version = 2, exportSchema = false)
 abstract class AppDb : RoomDatabase() {
     abstract fun dao(): CaptionDao
 
@@ -85,13 +86,19 @@ abstract class AppDb : RoomDatabase() {
         @Volatile
         private var instance: AppDb? = null
 
+        private val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE captions ADD COLUMN isSelf INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         fun get(context: Context): AppDb =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
                     context.applicationContext,
                     AppDb::class.java,
                     "captions.db"
-                ).build().also { instance = it }
+                ).addMigrations(MIGRATION_1_2).build().also { instance = it }
             }
     }
 }

@@ -32,7 +32,9 @@ import kotlin.math.abs
 class SherpaCaptionEngine(
     private val model: SherpaModel,
     private val audioEngine: AudioEngine,
-    private val onFinal: (String) -> Unit,
+    /** 聲紋判定（可為 null＝未啟用）；輸入為該句 16kHz 音訊，回傳是否為「自己」 */
+    private val identifySelf: ((FloatArray) -> Boolean)?,
+    private val onFinal: (String, Boolean) -> Unit,
 ) : AsrEngine {
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -114,22 +116,35 @@ class SherpaCaptionEngine(
             attached = true
 
             var lastPartial = ""
+            val segmentChunks = ArrayList<FloatArray>()
+            var segmentSamples = 0
             while (running) {
                 val chunk = queue.poll(100, TimeUnit.MILLISECONDS) ?: continue
                 stream.acceptWaveform(chunk, AsrConstants.SAMPLE_RATE)
+                // 累積本句音訊供聲紋判定（只留最後 N 秒）
+                segmentChunks.add(chunk)
+                segmentSamples += chunk.size
+                while (segmentSamples > AsrConstants.SAMPLE_RATE * SEGMENT_MAX_SECONDS &&
+                    segmentChunks.size > 1
+                ) {
+                    segmentSamples -= segmentChunks.removeAt(0).size
+                }
                 while (rec.isReady(stream)) rec.decode(stream)
                 val raw = rec.getResult(stream).text
                 if (rec.isEndpoint(stream)) {
                     if (raw.isNotBlank()) {
+                        val isSelf = judgeSelf(segmentChunks, segmentSamples)
                         val text = toTaiwan(raw)
                         mainHandler.post {
                             HearingState.isSpeaking = false
-                            onFinal(text)
+                            onFinal(text, isSelf)
                         }
                     } else {
                         mainHandler.post { HearingState.isSpeaking = false }
                     }
                     rec.reset(stream)
+                    segmentChunks.clear()
+                    segmentSamples = 0
                     lastPartial = ""
                 } else if (raw.isNotBlank() && raw != lastPartial) {
                     lastPartial = raw
@@ -145,7 +160,7 @@ class SherpaCaptionEngine(
             val raw = rec.getResult(stream).text
             if (raw.isNotBlank()) {
                 val text = toTaiwan(raw)
-                mainHandler.post { onFinal(text) }
+                mainHandler.post { onFinal(text, false) }
             }
             stream.release()
         } catch (t: Throwable) {
@@ -160,6 +175,23 @@ class SherpaCaptionEngine(
             }
         } finally {
             if (attached) audioEngine.removeSink(sink)
+        }
+    }
+
+    /** 聲紋判定：段落太短或未啟用時回傳 false（不標記） */
+    private fun judgeSelf(chunks: List<FloatArray>, totalSamples: Int): Boolean {
+        val judge = identifySelf ?: return false
+        if (totalSamples < MIN_JUDGE_SAMPLES) return false
+        val seg = FloatArray(totalSamples)
+        var pos = 0
+        for (c in chunks) {
+            System.arraycopy(c, 0, seg, pos, c.size)
+            pos += c.size
+        }
+        return try {
+            judge(seg)
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -181,6 +213,10 @@ class SherpaCaptionEngine(
     )
 
     companion object {
+        /** 句段音訊緩衝上限（秒）：只保留最後 N 秒供聲紋判定 */
+        private const val SEGMENT_MAX_SECONDS = 12
+        private val MIN_JUDGE_SAMPLES = (16000 * VoiceprintStore.MIN_SEGMENT_SECONDS).toInt()
+
         /** 簡體→台灣繁體（含台灣用語詞彙級轉換）；轉換失敗時原文返回 */
         fun toTaiwan(text: String): String = try {
             ZhTwConverterUtil.toTraditional(text)
