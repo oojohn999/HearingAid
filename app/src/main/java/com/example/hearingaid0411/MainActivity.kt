@@ -61,6 +61,9 @@ import androidx.core.content.ContextCompat
 import com.example.hearingaid0411.ui.theme.HearingAid0411Theme
 import kotlinx.coroutines.launch
 
+/** 捲動到內容最末端用的大 offset（會被系統夾在合法範圍內） */
+private const val SCROLL_TO_END_OFFSET = 10_000_000
+
 /** 簡易畫面導覽（不引入 nav library，長輩情境層級淺） */
 sealed interface Screen {
     data object Main : Screen
@@ -362,11 +365,13 @@ fun HearingScreen(
             }
         }
 
-        // ---- 字幕流 ----
-        Box(modifier = Modifier.weight(1f)) {
+        // ---- 字幕流（提詞機式：正在講的話固定浮在中下方，變長時往上滑） ----
+        androidx.compose.foundation.layout.BoxWithConstraints(modifier = Modifier.weight(1f)) {
             val listState = rememberLazyListState()
             val scope = rememberCoroutineScope()
             val totalCount = st.captions.size + if (st.partialText.isNotBlank()) 1 else 0
+            // 底部留白：讓最新一行文字停在約 62% 高度，而不是貼在底邊
+            val bottomPad = maxHeight * 0.38f
 
             val nearBottom by remember {
                 derivedStateOf {
@@ -377,8 +382,9 @@ fun HearingScreen(
             }
 
             LaunchedEffect(st.captions.size, st.partialText) {
-                if (totalCount > 0 && nearBottom) {
-                    listState.animateScrollToItem(totalCount - 1)
+                if (totalCount > 0 && nearBottom && !listState.isScrollInProgress) {
+                    // 大 offset 會被夾到內容最末端：最新的字永遠貼齊「底邊上方的留白線」
+                    listState.animateScrollToItem(totalCount - 1, SCROLL_TO_END_OFFSET)
                 }
             }
 
@@ -398,7 +404,7 @@ fun HearingScreen(
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 16.dp),
+                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = bottomPad),
             ) {
                 itemsIndexed(st.captions, key = { _, e -> e.id }) { index, entry ->
                     val showTime = index == 0 ||
@@ -456,7 +462,7 @@ fun HearingScreen(
 
             if (totalCount > 0 && !nearBottom) {
                 Button(
-                    onClick = { scope.launch { listState.scrollToItem(totalCount - 1) } },
+                    onClick = { scope.launch { listState.scrollToItem(totalCount - 1, SCROLL_TO_END_OFFSET) } },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 12.dp)
