@@ -9,12 +9,6 @@ import com.example.hearingaid0411.HearingState
 import com.example.hearingaid0411.UiError
 import com.example.hearingaid0411.audio.AudioEngine
 import com.github.houbb.opencc4j.util.ZhTwConverterUtil
-import com.k2fsa.sherpa.onnx.EndpointConfig
-import com.k2fsa.sherpa.onnx.FeatureConfig
-import com.k2fsa.sherpa.onnx.OnlineModelConfig
-import com.k2fsa.sherpa.onnx.OnlineRecognizer
-import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
-import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
@@ -43,7 +37,6 @@ class SherpaCaptionEngine(
     @Volatile
     private var running = false
     private var decodeThread: Thread? = null
-    private var recognizer: OnlineRecognizer? = null
     private var lastLevelAt = 0L
 
     /**
@@ -116,16 +109,15 @@ class SherpaCaptionEngine(
     }
 
     override fun destroy() {
+        // 辨識器由 SherpaRuntime 程序級快取持有，不在此釋放（下次秒開）
         stop()
-        try { recognizer?.release() } catch (_: Throwable) {}
-        recognizer = null
     }
 
     private fun runLoop() {
         var attached = false
         try {
-            // 模型載入（首次約數秒）；期間 UI 顯示「準備中…」
-            val rec = recognizer ?: OnlineRecognizer(null, buildConfig()).also { recognizer = it }
+            // 從程序級快取取得辨識器（未預載完成時會在此等待數秒；期間 UI 顯示「準備中…」）
+            val rec = SherpaRuntime.acquire(model)
             val stream = rec.createStream()
             mainHandler.post {
                 if (HearingState.wantsListening) {
@@ -215,23 +207,6 @@ class SherpaCaptionEngine(
             false
         }
     }
-
-    private fun buildConfig() = OnlineRecognizerConfig(
-        featConfig = FeatureConfig(sampleRate = AsrConstants.SAMPLE_RATE, featureDim = 80),
-        modelConfig = OnlineModelConfig(
-            transducer = OnlineTransducerModelConfig(
-                encoder = model.encoder,
-                decoder = model.decoder,
-                joiner = model.joiner,
-            ),
-            tokens = model.tokens,
-            numThreads = 2,
-            provider = "cpu",
-        ),
-        endpointConfig = EndpointConfig(),
-        enableEndpoint = true,
-        decodingMethod = "greedy_search",
-    )
 
     companion object {
         /** 句段音訊緩衝上限（秒）：只保留最後 N 秒供聲紋判定 */

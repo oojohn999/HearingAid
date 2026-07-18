@@ -94,6 +94,8 @@ class MainActivity : ComponentActivity() {
         HearingState.init(this)
         HearingState.offlineModelReady =
             com.example.hearingaid0411.asr.SherpaModelLocator.find(this) != null
+        // 背景預載離線辨識器（67MB 模型載入需數秒；預載後按「開始聆聽」即秒開）
+        com.example.hearingaid0411.asr.SherpaRuntime.preloadAsync(this)
         enableEdgeToEdge()
 
         setContent {
