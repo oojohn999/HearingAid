@@ -80,15 +80,17 @@ class SherpaCaptionEngine(
                 }
             }
             queue.offer(out) // 佇列滿時丟棄（辨識落後就先犧牲舊音訊，不阻塞擷取執行緒）
-            postLevel(peak)
+            // 音量條顯示「放大後」的等級＝辨識引擎實際聽到的（與辨識靈敏度一致）
+            postLevel((peakF * agcGain).coerceAtMost(1f))
         }
     }
 
-    private fun postLevel(peak: Int) {
+    private fun postLevel(boostedPeak: Float) {
         val now = SystemClock.elapsedRealtime()
         if (now - lastLevelAt < 100) return
         lastLevelAt = now
-        val level = (peak / 4000).coerceIn(0, 5)
+        // 0.05→1 格、0.5+→5 格；AGC 目標音量（0.30）約落在 3 格
+        val level = (boostedPeak * 10f).toInt().coerceIn(0, 5)
         mainHandler.post { HearingState.rmsLevel = level }
     }
 
