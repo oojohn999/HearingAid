@@ -53,6 +53,11 @@ class HearingService : Service() {
 
         /** 對話紀錄預設保留 30 天 */
         private const val RETENTION_DAYS = 30
+
+        /** 閒置自動停止：連續這麼久沒聽到說話聲就自動停止聆聽（省電＋避免忘記關） */
+        private const val IDLE_AUTO_STOP_MS = 10 * 60 * 1000L
+        private const val IDLE_CHECK_INTERVAL_MS = 60 * 1000L
+        private const val IDLE_NOTIFICATION_ID = 2
     }
 
     private lateinit var asr: AsrEngine
@@ -68,6 +73,21 @@ class HearingService : Service() {
 
     private var currentSessionId = -1L
     private var lastSentenceAt = 0L
+
+    private val idleHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var lastActivityAt = 0L
+    private val idleCheck = object : Runnable {
+        override fun run() {
+            if (!HearingState.wantsListening) return
+            if (android.os.SystemClock.elapsedRealtime() - lastActivityAt > IDLE_AUTO_STOP_MS) {
+                notifyIdleStopped()
+                stopEverything()
+                stopSelf()
+            } else {
+                idleHandler.postDelayed(this, IDLE_CHECK_INTERVAL_MS)
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -136,6 +156,10 @@ class HearingService : Service() {
                 startAsForeground()
                 HearingState.wantsListening = true
                 HearingState.errorMessage = null
+                // 啟動閒置監測：太久沒聽到說話聲就自動停止
+                lastActivityAt = android.os.SystemClock.elapsedRealtime()
+                idleHandler.removeCallbacks(idleCheck)
+                idleHandler.postDelayed(idleCheck, IDLE_CHECK_INTERVAL_MS)
                 if (sherpaMode) {
                     if (audioEngine.start()) {
                         asr.start()
@@ -170,6 +194,7 @@ class HearingService : Service() {
     // ---- 字幕定稿 → 記憶體 + Room 持久化（含場次切分） ----
 
     private fun onFinalSentence(text: String, isSelf: Boolean) {
+        lastActivityAt = android.os.SystemClock.elapsedRealtime()
         val entry = HearingState.finalizeSentence(text, isSelf) ?: return
         dbScope.launch {
             ensureSession(entry.timeMillis)
@@ -236,7 +261,30 @@ class HearingService : Service() {
     private fun audioEngineNeeded(): Boolean =
         (sherpaMode && HearingState.wantsListening) || HearingState.ampRunning
 
+    /** 閒置自動停止時發一則說明通知（讓使用者知道為什麼停了） */
+    private fun notifyIdleStopped() {
+        val manager = getSystemService(NotificationManager::class.java)
+        val openIntent = PendingIntent.getActivity(
+            this, 2,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle("輔聽字幕已自動停止")
+            .setContentText("有 10 分鐘沒聽到說話聲了。要繼續請打開 App 再按「開始聆聽」")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("有 10 分鐘沒聽到說話聲了。要繼續請打開 App 再按「開始聆聽」")
+            )
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .build()
+        manager.notify(IDLE_NOTIFICATION_ID, notification)
+    }
+
     private fun stopEverything() {
+        idleHandler.removeCallbacks(idleCheck)
         HearingState.wantsListening = false
         asr.stop()
         HearingState.ampWanted = false
