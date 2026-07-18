@@ -46,8 +46,16 @@ class SherpaCaptionEngine(
     private var recognizer: OnlineRecognizer? = null
     private var lastLevelAt = 0L
 
-    /** 48k→16k 降採樣 Sink：每 3 個樣本平均為 1 個（簡易抗混疊） */
+    /**
+     * 48k→16k 降採樣 Sink（每 3 個樣本平均為 1 個，簡易抗混疊）＋
+     * 軟體 AGC：VOICE_RECOGNITION 音源多數手機不開自動增益，
+     * 遠場（手機放遠一點）音量太小會讓辨識沒反應——這裡把安靜的
+     * 語音自動放大（上限約 +21dB），並設噪音門檻避免放大純環境噪音。
+     * 只作用於辨識分支，不影響擴音通路。
+     */
     private val sink = object : AudioEngine.Sink {
+        private var agcGain = 1f
+
         override fun onPcm(buf: ShortArray, n: Int) {
             val outN = n / 3
             if (outN == 0) return
@@ -59,6 +67,17 @@ class SherpaCaptionEngine(
                 if (abs(s) > peak) peak = abs(s)
                 out[j] = s / 32768f
                 i += 3
+            }
+            // AGC：快速壓低（防爆音）、緩慢拉高（避免把靜音段噪音抬上來）
+            val peakF = peak / 32768f
+            if (peakF > AGC_NOISE_FLOOR) {
+                val desired = (AGC_TARGET / peakF).coerceIn(1f, AGC_MAX_GAIN)
+                agcGain += (desired - agcGain) * (if (desired < agcGain) 0.5f else 0.03f)
+            }
+            if (agcGain > 1.01f) {
+                for (j in 0 until outN) {
+                    out[j] = (out[j] * agcGain).coerceIn(-1f, 1f)
+                }
             }
             queue.offer(out) // 佇列滿時丟棄（辨識落後就先犧牲舊音訊，不阻塞擷取執行緒）
             postLevel(peak)
@@ -216,6 +235,11 @@ class SherpaCaptionEngine(
         /** 句段音訊緩衝上限（秒）：只保留最後 N 秒供聲紋判定 */
         private const val SEGMENT_MAX_SECONDS = 12
         private val MIN_JUDGE_SAMPLES = (16000 * VoiceprintStore.MIN_SEGMENT_SECONDS).toInt()
+
+        /** AGC 參數：目標峰值 30% 滿刻度、最大增益 12 倍（約 +21.6dB）、噪音門檻 */
+        private const val AGC_TARGET = 0.30f
+        private const val AGC_MAX_GAIN = 12f
+        private const val AGC_NOISE_FLOOR = 0.006f
 
         /** 簡體→台灣繁體（含台灣用語詞彙級轉換）；轉換失敗時原文返回 */
         fun toTaiwan(text: String): String = try {

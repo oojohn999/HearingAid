@@ -382,9 +382,10 @@ fun HearingScreen(
 
             if (totalCount == 0 && st.errorMessage == null) {
                 Text(
-                    text = if (st.wantsListening) "正在聽，請說話…" else "按下面的綠色按鈕，開始聽",
+                    text = if (st.wantsListening) "正在聽，請說話…\n\n手機放在說話的人附近，效果最好"
+                    else "按下面的綠色按鈕，開始聽",
                     fontSize = 26.sp,
-                    lineHeight = 36.sp,
+                    lineHeight = 38.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier
                         .align(Alignment.Center)
